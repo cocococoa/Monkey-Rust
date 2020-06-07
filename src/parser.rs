@@ -317,10 +317,13 @@ impl Lexer {
                     )))
                 }
             }
-            _ => Err(LexError::invalid_char(
-                self.ch as char,
-                Loc(self.current_position - 1, self.current_position),
-            )),
+            _ => {
+                self.read_char();
+                Err(LexError::invalid_char(
+                    self.ch as char,
+                    Loc(self.current_position - 1, self.current_position),
+                ))
+            }
         }
     }
     fn read_char(&mut self) {
@@ -373,15 +376,22 @@ impl Statement {
     fn exp_stmt(exp: Ast) -> Self {
         Statement::Expression(Box::new(exp))
     }
-    // fn let_stmt(ident: Ast, exp: Ast) -> Self {
-    //     Statement::Let {
-    //         ident: Box::new(ident),
-    //         exp: Box::new(exp),
-    //     }
-    // }
-    // fn return_stmt(exp: Ast) -> Self {
-    //     Statement::Return(Box::new(exp))
-    // }
+    fn let_stmt(ident: Ast, exp: Ast) -> Self {
+        Statement::Let {
+            ident: Box::new(ident),
+            exp: Box::new(exp),
+        }
+    }
+    fn return_stmt(exp: Ast) -> Self {
+        Statement::Return(Box::new(exp))
+    }
+    pub fn loc(&self) -> Loc {
+        match self {
+            Statement::Expression(exp) => exp.loc.clone(),
+            Statement::Let { ident: _, exp } => exp.loc.clone(),
+            Statement::Return(exp) => exp.loc.clone(),
+        }
+    }
 }
 
 type Statements = Vec<Statement>;
@@ -390,6 +400,8 @@ type Statements = Vec<Statement>;
 pub enum AstKind {
     Num(u64),
     Ident(Vec<u8>),
+    Boolean(bool),
+    Argument(Vec<Ast>),
     UniOp {
         op: UniOp,
         e: Box<Ast>,
@@ -401,13 +413,16 @@ pub enum AstKind {
     },
     If {
         cond: Box<Ast>,
-        true_close: Statements,
-        false_close: Statements,
+        consequence: Statements,
+        alternative: Statements,
     },
     Function {
-        name: Vec<u8>,
-        signature: Box<Ast>,
+        parameters: Box<Vec<Vec<u8>>>,
         body: Statements,
+    },
+    Call {
+        function: Box<Ast>,
+        args: Box<Ast>,
     },
 }
 type Ast = Annot<AstKind>;
@@ -418,6 +433,12 @@ impl Ast {
     fn ident(ident: &Vec<u8>, loc: Loc) -> Self {
         Self::new(AstKind::Ident(ident.clone()), loc)
     }
+    fn boolean(b: bool, loc: Loc) -> Self {
+        Self::new(AstKind::Boolean(b), loc)
+    }
+    fn argument(arg: Vec<Ast>, loc: Loc) -> Self {
+        Self::new(AstKind::Argument(arg), loc)
+    }
     fn uniop(op: UniOp, e: Ast, loc: Loc) -> Self {
         Self::new(AstKind::UniOp { op, e: Box::new(e) }, loc)
     }
@@ -427,6 +448,34 @@ impl Ast {
                 op,
                 l: Box::new(l),
                 r: Box::new(r),
+            },
+            loc,
+        )
+    }
+    fn if_ast(cond: Ast, consequence: Statements, alternative: Statements, loc: Loc) -> Self {
+        Self::new(
+            AstKind::If {
+                cond: Box::new(cond),
+                consequence,
+                alternative,
+            },
+            loc,
+        )
+    }
+    fn function(parameters: &Vec<Vec<u8>>, body: Statements, loc: Loc) -> Self {
+        Self::new(
+            AstKind::Function {
+                parameters: Box::new(parameters.clone()),
+                body: body,
+            },
+            loc,
+        )
+    }
+    fn call(function: Ast, args: Ast, loc: Loc) -> Self {
+        Self::new(
+            AstKind::Call {
+                function: Box::new(function),
+                args: Box::new(args),
             },
             loc,
         )
@@ -499,7 +548,7 @@ enum Precedance {
     SUM,
     PRODUCT,
     PREFIX,
-    // CALL,
+    CALL,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -509,30 +558,73 @@ pub enum ParseError {
     NotOperator(Token),
     UnclosedOpenParen(Token),
     RedundantExpression(Token),
+    LexError(LexError), // 最悪
+    SeriousError,       // 最悪
     Eof,
 }
 
-pub enum Error {
-    ParseError(ParseError),
-    LexError(LexError),
-}
+// pub enum Error {
+//     ParseError(ParseError),
+//     LexError(LexError),
+// }
 
 pub struct Parser {
     lexer: Lexer,
-    // errors: Vec<Error>,
+    errors: Vec<ParseError>,
+    statements: Statements,
     cur_token: Token,
     peek_token: Token,
 }
+// TODO: if式中など、ネストの深いところでエラーが起きるともうダメ
 impl Parser {
     pub fn new(input: &str) -> Self {
-        let mut lexer = Lexer::new(input);
-        let cur_token = lexer.next_token().unwrap();
-        let peek_token = lexer.next_token().unwrap();
-        Parser {
-            lexer: lexer,
-            // errors: vec![],
-            cur_token: cur_token,
-            peek_token: peek_token,
+        let mut parser = Parser {
+            lexer: Lexer::new(input),
+            errors: vec![],
+            statements: vec![],
+            cur_token: Token::eof(Loc(0, 0)),
+            peek_token: Token::eof(Loc(0, 0)),
+        };
+        parser.initialize_parser();
+        parser
+    }
+    pub fn is_err(&self) -> bool {
+        self.errors.len() != 0
+    }
+    pub fn errors(&self) -> &Vec<ParseError> {
+        &self.errors
+    }
+    fn initialize_parser(&mut self) {
+        let first = self.lexer.next_token();
+        if first.is_err() {
+            self.errors.push(ParseError::LexError(first.unwrap_err()));
+            self.skip_until_next_semicolon();
+            self.initialize_parser();
+        } else {
+            let second = self.lexer.next_token();
+            if second.is_err() {
+                self.errors.push(ParseError::LexError(first.unwrap_err()));
+                self.skip_until_next_semicolon();
+                self.initialize_parser();
+            } else {
+                // finish initialization
+                self.cur_token = first.unwrap();
+                self.peek_token = second.unwrap();
+            }
+        }
+    }
+    fn skip_until_next_semicolon(&mut self) {
+        loop {
+            match self.lexer.next_token() {
+                Ok(token) => {
+                    if token.value == TokenKind::SEMICOLON || token.value == TokenKind::EOF {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    self.errors.push(ParseError::LexError(err));
+                }
+            }
         }
     }
     fn next_token(&mut self) {
@@ -550,6 +642,7 @@ impl Parser {
             TokenKind::MINUS => Precedance::SUM,
             TokenKind::SLASH => Precedance::PRODUCT,
             TokenKind::ASTERISK => Precedance::PRODUCT,
+            TokenKind::LPAREN => Precedance::CALL,
             _ => Precedance::LOWEST,
         }
     }
@@ -559,6 +652,75 @@ impl Parser {
     fn cur_precedance(&self) -> Precedance {
         Self::token_precedance(&self.cur_token.value)
     }
+    fn consume_peek(&mut self, tok: TokenKind) -> Result<(), ParseError> {
+        if self.peek_token.value == tok {
+            self.next_token();
+            Ok(())
+        } else {
+            Err(ParseError::UnexpectedToken(self.peek_token.clone()))
+        }
+    }
+    fn consume_current(&mut self, tok: TokenKind) -> Result<(), ParseError> {
+        if self.cur_token.value == tok {
+            self.next_token();
+            Ok(())
+        } else {
+            Err(ParseError::UnexpectedToken(self.cur_token.clone()))
+        }
+    }
+    // fn expect_peek(&mut self, tok: TokenKind) -> Result<(), ParseError> {
+    //     if self.peek_token.value == tok {
+    //         Ok(())
+    //     } else {
+    //         Err(ParseError::UnexpectedToken(self.peek_token.clone()))
+    //     }
+    // }
+    fn expect_current(&mut self, tok: TokenKind) -> Result<(), ParseError> {
+        if self.cur_token.value == tok {
+            Ok(())
+        } else {
+            Err(ParseError::UnexpectedToken(self.cur_token.clone()))
+        }
+    }
+    pub fn parse_program(&mut self) {
+        match self.parse_statements() {
+            Ok(statements) => self.statements = statements,
+            Err(error) => {
+                self.errors.push(error);
+            }
+        }
+    }
+    pub fn parse_statements(&mut self) -> Result<Statements, ParseError> {
+        let mut ret = vec![];
+        loop {
+            if self.cur_token.value == TokenKind::EOF {
+                break;
+            } else {
+                match self.parse_statement() {
+                    Ok(stmt) => ret.push(stmt),
+                    Err(_) => return Err(ParseError::SeriousError),
+                }
+            }
+        }
+        Ok(ret)
+    }
+    pub fn parse_blocked_statements(&mut self) -> Result<Statements, ParseError> {
+        let mut ret = vec![];
+        loop {
+            if self.peek_token.value == TokenKind::EOF {
+                return Err(ParseError::SeriousError);
+            } else {
+                match self.parse_statement() {
+                    Ok(stmt) => ret.push(stmt),
+                    Err(_) => return Err(ParseError::SeriousError),
+                }
+            }
+            if self.cur_token.value == TokenKind::RBRACE {
+                break;
+            }
+        }
+        Ok(ret)
+    }
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         match self.cur_token.value {
             TokenKind::LET => self.parse_let_statement(),
@@ -567,32 +729,51 @@ impl Parser {
         }
     }
     fn parse_let_statement(&mut self) -> Result<Statement, ParseError> {
-        unimplemented!();
+        self.consume_current(TokenKind::LET)?;
+        let ident = self.parse_ident()?;
+        self.next_token();
+        self.consume_current(TokenKind::ASSIGN)?;
+        let exp = self.parse_expression(Precedance::LOWEST)?;
+        self.consume_peek(TokenKind::SEMICOLON)?;
+        self.next_token();
+        Ok(Statement::let_stmt(ident, exp))
     }
     fn parse_return_statement(&mut self) -> Result<Statement, ParseError> {
-        unimplemented!();
+        self.consume_current(TokenKind::RETURN)?;
+        let exp = self.parse_expression(Precedance::LOWEST)?;
+        self.consume_peek(TokenKind::SEMICOLON)?;
+        self.next_token();
+        Ok(Statement::return_stmt(exp))
     }
     fn parse_expression_statement(&mut self) -> Result<Statement, ParseError> {
         let exp = self.parse_expression(Precedance::LOWEST);
         if self.peek_token.value == TokenKind::SEMICOLON {
             self.next_token();
         }
-
+        self.next_token();
         exp.and_then(|ast| Ok(Statement::exp_stmt(ast)))
     }
     fn parse_expression(&mut self, predcedance: Precedance) -> Result<Ast, ParseError> {
+        // println!("cur: {:?}, peek: {:?}", self.cur_token, self.peek_token);
         let mut left_exp = match &self.cur_token.value {
             TokenKind::IDENT(_) => self.parse_ident(),
             TokenKind::NUM(_) => self.parse_num(),
+            TokenKind::TRUE | TokenKind::FALSE => self.parse_bool(),
             TokenKind::MINUS | TokenKind::BANG => self.parse_prefix_expression(),
             TokenKind::LPAREN => self.parse_ground_expression(),
+            TokenKind::IF => self.parse_if_expression(),
+            TokenKind::FUNCTION => self.parse_fn_expression(),
             _ => unreachable!(),
         }?;
         while self.peek_token.value != TokenKind::SEMICOLON && predcedance < self.peek_precedance()
         {
             self.next_token();
             let loc = left_exp.loc.clone();
-            left_exp = self.parse_infix_expression(left_exp)?;
+            left_exp = if self.cur_token.value == TokenKind::LPAREN {
+                self.parse_call_expression(left_exp)
+            } else {
+                self.parse_infix_expression(left_exp)
+            }?;
             left_exp.loc = left_exp.loc.merge(&loc);
         }
 
@@ -610,8 +791,14 @@ impl Parser {
             _ => Err(ParseError::UnexpectedToken(self.cur_token.clone())),
         }
     }
+    fn parse_bool(&mut self) -> Result<Ast, ParseError> {
+        match &self.cur_token.value {
+            TokenKind::TRUE => Ok(Ast::boolean(true, self.cur_token.loc.clone())),
+            TokenKind::FALSE => Ok(Ast::boolean(true, self.cur_token.loc.clone())),
+            _ => Err(ParseError::UnexpectedToken(self.cur_token.clone())),
+        }
+    }
     fn parse_prefix_expression(&mut self) -> Result<Ast, ParseError> {
-        // TODO: 最初のトークンがuniopじゃないときのエラー処理.. 不要かも？
         let uniop = match &self.cur_token.value {
             TokenKind::BANG => UniOp::bang(self.cur_token.loc.clone()),
             TokenKind::MINUS => UniOp::minus(self.cur_token.loc.clone()),
@@ -624,7 +811,6 @@ impl Parser {
         Ok(Ast::uniop(uniop, exp, loc))
     }
     fn parse_infix_expression(&mut self, left_exp: Ast) -> Result<Ast, ParseError> {
-        // TODO: 最初のトークンがbinopじゃないときのエラー処理.. 不要かも？
         let binop = match &self.cur_token.value {
             TokenKind::EQ => BinOp::eq(self.cur_token.loc.clone()),
             TokenKind::NOTEQ => BinOp::not_eq(self.cur_token.loc.clone()),
@@ -643,8 +829,25 @@ impl Parser {
 
         Ok(Ast::binop(binop, left_exp, right_exp, loc))
     }
+    fn parse_call_expression(&mut self, left_exp: Ast) -> Result<Ast, ParseError> {
+        let mut ret = vec![];
+        let mut loc = self.cur_token.loc.clone();
+        self.consume_current(TokenKind::LPAREN)?;
+        while self.cur_token.value != TokenKind::RPAREN {
+            let exp = self.parse_expression(Precedance::LOWEST)?;
+            loc = loc.merge(&exp.loc);
+            ret.push(exp);
+            self.next_token();
+            match self.cur_token.value {
+                TokenKind::COMMA => self.next_token(),
+                TokenKind::RPAREN => (),
+                _ => return Err(ParseError::UnexpectedToken(self.cur_token.clone())),
+            }
+        }
+        let total_loc = left_exp.loc.clone().merge(&loc);
+        Ok(Ast::call(left_exp, Ast::argument(ret, loc), total_loc))
+    }
     fn parse_ground_expression(&mut self) -> Result<Ast, ParseError> {
-        // TODO: 最初のトークンが ( じゃないときのエラー処理.. 不要かも？
         self.next_token();
         let exp = self.parse_expression(Precedance::LOWEST)?;
         if self.peek_token.value != TokenKind::RPAREN {
@@ -653,6 +856,69 @@ impl Parser {
             self.next_token();
             Ok(exp)
         }
+    }
+    fn parse_if_expression(&mut self) -> Result<Ast, ParseError> {
+        let if_loc = self.cur_token.loc.clone();
+        self.next_token();
+        let exp = self.parse_expression(Precedance::LOWEST)?;
+        self.consume_current(TokenKind::RPAREN)?;
+        self.consume_current(TokenKind::LBRACE)?;
+        let stmt1 = self.parse_blocked_statements()?;
+        self.expect_current(TokenKind::RBRACE)?;
+
+        match self.peek_token.value {
+            TokenKind::ELSE => {
+                self.next_token();
+                self.consume_current(TokenKind::ELSE)?;
+                self.consume_current(TokenKind::LBRACE)?;
+                let stmt2 = self.parse_blocked_statements()?;
+                self.expect_current(TokenKind::RBRACE)?;
+                let loc = if_loc.merge(&exp.loc).merge(&self.cur_token.loc);
+                Ok(Ast::if_ast(exp, stmt1, stmt2, loc))
+            }
+            _ => {
+                let loc = if_loc.merge(&exp.loc).merge(&self.cur_token.loc);
+                Ok(Ast::if_ast(exp, stmt1, vec![], loc))
+            }
+        }
+    }
+    fn parse_fn_expression(&mut self) -> Result<Ast, ParseError> {
+        let fn_loc = self.cur_token.loc.clone();
+        self.consume_current(TokenKind::FUNCTION)?;
+        self.consume_current(TokenKind::LPAREN)?;
+        let parameters = self.parse_parameters()?;
+        self.consume_current(TokenKind::RPAREN)?;
+        self.consume_current(TokenKind::LBRACE)?;
+        let stmt1 = self.parse_blocked_statements()?;
+        self.expect_current(TokenKind::RBRACE)?;
+        Ok(Ast::function(
+            &parameters,
+            stmt1,
+            fn_loc.merge(&self.cur_token.loc),
+        ))
+    }
+    fn parse_parameters(&mut self) -> Result<Vec<Vec<u8>>, ParseError> {
+        let mut ret = vec![];
+        while self.cur_token.value != TokenKind::RPAREN {
+            let ident = match &self.cur_token.value {
+                TokenKind::IDENT(ident) => Ok(ident.clone()),
+                _ => Err(ParseError::UnexpectedToken(self.cur_token.clone())),
+            }?;
+            ret.push(ident);
+            self.next_token();
+            match self.cur_token.value {
+                TokenKind::COMMA => {
+                    self.next_token();
+                }
+                TokenKind::RPAREN => {
+                    ();
+                }
+                _ => {
+                    return Err(ParseError::UnexpectedToken(self.cur_token.clone()));
+                }
+            }
+        }
+        Ok(ret)
     }
 }
 
@@ -985,5 +1251,66 @@ let result = add(five, ten);
         let input1 = "5 * (2 + 3 * 4)";
         let input2 = "((((5*(2+(3*4))))))";
         compare_ast_without_loc(input1, input2);
+    }
+    #[test]
+    fn test_parser5() {
+        let input = "if (x<y) {x}";
+        let expected = Ast::if_ast(
+            Ast::binop(
+                BinOp::lt(Loc(5, 6)),
+                Ast::ident(&vec![b'x'], Loc(4, 5)),
+                Ast::ident(&vec![b'y'], Loc(6, 7)),
+                Loc(4, 7),
+            ),
+            vec![Statement::exp_stmt(Ast::ident(&vec![b'x'], Loc(10, 11)))],
+            vec![],
+            Loc(0, 12),
+        );
+        compare_ast_with_expected(input, expected);
+
+        let input = "if (x<y) {x} else {y} + 20";
+        let expected = Ast::if_ast(
+            Ast::binop(
+                BinOp::lt(Loc(5, 6)),
+                Ast::ident(&vec![b'x'], Loc(4, 5)),
+                Ast::ident(&vec![b'y'], Loc(6, 7)),
+                Loc(4, 7),
+            ),
+            vec![Statement::exp_stmt(Ast::ident(&vec![b'x'], Loc(10, 11)))],
+            vec![Statement::exp_stmt(Ast::ident(&vec![b'y'], Loc(19, 20)))],
+            Loc(0, 21),
+        );
+        let expected = Ast::binop(
+            BinOp::add(Loc(22, 23)),
+            expected,
+            Ast::num(20, Loc(24, 26)),
+            Loc(0, 26),
+        );
+        compare_ast_with_expected(input, expected);
+    }
+    #[test]
+    fn test_parser6() {
+        let input = "fn (x, y, z) { x * x + y * y }";
+        let expected = Ast::function(
+            &vec![vec![b'x'], vec![b'y'], vec![b'z']],
+            vec![Statement::Expression(Box::new(Ast::binop(
+                BinOp::add(Loc(21, 22)),
+                Ast::binop(
+                    BinOp::mult(Loc(17, 18)),
+                    Ast::ident(&vec![b'x'], Loc(15, 16)),
+                    Ast::ident(&vec![b'x'], Loc(19, 20)),
+                    Loc(15, 20),
+                ),
+                Ast::binop(
+                    BinOp::mult(Loc(25, 26)),
+                    Ast::ident(&vec![b'y'], Loc(23, 24)),
+                    Ast::ident(&vec![b'y'], Loc(27, 28)),
+                    Loc(23, 28),
+                ),
+                Loc(15, 28),
+            )))],
+            Loc(0, 30),
+        );
+        compare_ast_with_expected(input, expected);
     }
 }
