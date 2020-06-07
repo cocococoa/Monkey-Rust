@@ -21,11 +21,13 @@ fn main() {
         prompt(">>> ").unwrap();
         if let Some(Ok(line)) = lines.next() {
             let mut parser = Parser::new(&line);
-            let stmts = parser.parse_statements();
+            parser.parse_program();
             if parser.is_err() {
                 println!("{:?}", parser.errors());
             } else {
-                println!("{:?}", stmts.unwrap());
+                for stmt in parser.statements() {
+                    println!("{:?}", stmt);
+                }
             }
         } else {
             break;

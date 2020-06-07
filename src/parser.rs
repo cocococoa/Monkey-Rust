@@ -594,6 +594,9 @@ impl Parser {
     pub fn errors(&self) -> &Vec<ParseError> {
         &self.errors
     }
+    pub fn statements(&self) -> &Statements {
+        &self.statements
+    }
     fn initialize_parser(&mut self) {
         let first = self.lexer.next_token();
         if first.is_err() {
@@ -690,7 +693,7 @@ impl Parser {
             }
         }
     }
-    pub fn parse_statements(&mut self) -> Result<Statements, ParseError> {
+    fn parse_statements(&mut self) -> Result<Statements, ParseError> {
         let mut ret = vec![];
         loop {
             if self.cur_token.value == TokenKind::EOF {
@@ -704,7 +707,7 @@ impl Parser {
         }
         Ok(ret)
     }
-    pub fn parse_blocked_statements(&mut self) -> Result<Statements, ParseError> {
+    fn parse_blocked_statements(&mut self) -> Result<Statements, ParseError> {
         let mut ret = vec![];
         loop {
             if self.peek_token.value == TokenKind::EOF {
